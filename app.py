@@ -1,199 +1,7 @@
-import os
-import re
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-
-import pandas as pd
-import requests
-import streamlit as st
-from bs4 import BeautifulSoup
-
-TOTO_URL = "https://sport.toto.nl/wedden/11/voetbal/wedstrijden"
-FD_URL = "https://api.football-data.org/v4"
-TZ = ZoneInfo("Europe/Amsterdam")
-
-st.set_page_config(page_title="TOTO AI Voorspeller v7", page_icon="⚽", layout="wide")
-
-
-# ============================================================
-# CONFIG / API
-# ============================================================
-def get_key():
-    try:
-        return str(st.secrets.get("FOOTBALL_DATA_API_KEY", "")).strip()
-    except Exception:
-        return os.getenv("FOOTBALL_DATA_API_KEY", "").strip()
-
-
-KEY = get_key()
-
-
-@st.cache_data(ttl=300)
-def fd_get(path, params=None):
-    if not KEY:
-        return None, "Geen football-data.org API-key."
-    try:
-        r = requests.get(
-            FD_URL + path,
-            params=params or {},
-            headers={"X-Auth-Token": KEY},
-            timeout=25,
-        )
-        if r.status_code == 200:
-            return r.json(), ""
-        return None, f"football-data.org HTTP {r.status_code}: {r.text[:160]}"
-    except Exception as e:
-        return None, str(e)
-
-
-@st.cache_data(ttl=300)
-def test_fd():
-    data, err = fd_get("/competitions")
-    return data is not None, err
-
-
-@st.cache_data(ttl=300)
-def get_fd_matches(date_from, date_to):
-    data, err = fd_get(
-        "/matches",
-        {"dateFrom": date_from, "dateTo": date_to},
-    )
-    return (data or {}).get("matches", []), err
-
-
-# ============================================================
-# TOTO DATA
-# v7 haalt de wedstrijden van vandaag primair uit TOTO.
-# football-data.org wordt alleen gebruikt voor historische vorm.
-# ============================================================
-@st.cache_data(ttl=180)
-def get_toto_text():
-    r = requests.get(
-        TOTO_URL,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/151 Safari/537.36"
-            ),
-            "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
-        },
-        timeout=30,
-    )
-    r.raise_for_status()
-    return BeautifulSoup(r.text, "html.parser").get_text("\n")
-
-
-def clean_lines(text):
-    return [re.sub(r"\s+", " ", x).strip() for x in text.splitlines() if x.strip()]
-
-
-def parse_decimal(s):
-    try:
-        return float(str(s).replace(",", "."))
-    except Exception:
-        return None
-
-
-def is_odd(s):
-    x = parse_decimal(s)
-    return x is not None and 1.01 <= x <= 100
-
-
-def parse_toto_today(text):
-    """
-    Parseert de 1/X/2-markt uit de server-rendered tekst van TOTO.
-    v7 kijkt specifiek naar 'Vandaag' en 1/X/2 + odds.
-    """
-    lines = clean_lines(text)
-    rows = []
-
-    # Patroon in TOTO-pagina's:
-    # Team A / Team B / Resultaat / 1 / odd / X / odd / 2 / odd / Vandaag HH:MM
-    for i in range(len(lines) - 12):
-        window = lines[i:i + 22]
-        joined = " | ".join(window)
-
-        if "Vandaag" not in joined:
-            continue
-
-        # Zoek een 1-X-2 blok.
-        for j in range(i, min(i + 12, len(lines) - 6)):
-            if lines[j] != "1":
-                continue
-            if lines[j + 2] != "X" or lines[j + 4] != "2":
-                continue
-
-            o1 = parse_decimal(lines[j + 1])
-            ox = parse_decimal(lines[j + 3])
-            o2 = parse_decimal(lines[j + 5])
-            if not all(is_odd(x) for x in [o1, ox, o2]):
-                continue
-
-            after = lines[j + 6:j + 15]
-            time_match = next(
-                (
-                    re.search(r"Vandaag\s+(\d{1,2}:\d{2})", x, re.I)
-                    for x in after
-                    if re.search(r"Vandaag\s+\d{1,2}:\d{2}", x, re.I)
-                ),
-                None,
-            )
-            if not time_match:
-                continue
-
-            # Zoek de twee teamnamen kort vóór het 1/X/2 blok.
-            candidates = []
-            for k in range(max(0, j - 10), j):
-                x = lines[k]
-                if (
-                    x not in {"Wedoptie", "Resultaat", "Resultaat - Vroege uitbetaling"}
-                    and "Vandaag" not in x
-                    and not is_odd(x)
-                    and x not in {"1", "X", "2"}
-                ):
-                    candidates.append(x)
-
-            if len(candidates) < 2:
-                continue
-
-            home, away = candidates[-2], candidates[-1]
-
-            # Vermijd specials zoals "Bologna / No Score".
-            if len(home) < 2 or len(away) < 2:
-                continue
-
-            raw = [1 / o1, 1 / ox, 1 / o2]
-            total = sum(raw)
-
-            rows.append(
-                {
-                    "home": home,
-                    "away": away,
-                    "time": time_match.group(1),
-                    "o1": o1,
-                    "ox": ox,
-                    "o2": o2,
-                    "market_1": raw[0] / total * 100,
-                    "market_x": raw[1] / total * 100,
-                    "market_2": raw[2] / total * 100,
-                }
-            )
-            break
-
-    # Dubbelen verwijderen.
-    unique = {}
-    for r in rows:
-        unique[(r["home"], r["away"], r["time"])] = r
-
-    return list(unique.values())
-
-
-# ============================================================
-# TEAM MATCHING / HISTORISCHE VORM
-# ============================================================
 ALIASES = {
     "fc nordsjaelland": "nordsjaelland",
     "fc nordjsaelland": "nordsjaelland",
+    "nordsjaelland": "nordsjaelland",
     "psv eindhoven": "psv",
     "afc ajax": "ajax",
     "ajax amsterdam": "ajax",
@@ -201,15 +9,20 @@ ALIASES = {
     "fc twente": "twente",
     "fc utrecht": "utrecht",
     "fc groningen": "groningen",
+    "nec nijmegen": "nec nijmegen",
     "n e c nijmegen": "nec nijmegen",
-    "n.e.c. nijmegen": "nec nijmegen",
+    "sparta rotterdam": "sparta",
+    "az alkmaar": "az",
+    "rkc waalwijk": "rkc waalwijk",
+    "go ahead eagles": "go ahead eagles",
 }
 
 
 def norm(name):
     s = str(name).lower()
+    s = s.replace("&", " and ")
     s = re.sub(r"[^a-z0-9 ]+", " ", s)
-    s = re.sub(r"\b(fc|cf|sc|afc)\b", " ", s)
+    s = re.sub(r"\b(fc|cf|sc|afc|ac|fk|bk)\b", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return ALIASES.get(s, s)
 
@@ -221,14 +34,16 @@ def sim(a, b):
     if a == b:
         return 100
     if a in b or b in a:
-        return 88
-    sa, sb = set(a.split()), set(b.split())
-    overlap = len(sa & sb)
+        return 92
+
+    ta, tb = set(a.split()), set(b.split())
+    overlap = len(ta & tb)
     if overlap >= 2:
-        return 72
-    if overlap == 1 and (len(sa) == 1 or len(sb) == 1):
-        return 65
-    return 0
+        return 82
+    if overlap == 1:
+        return 68
+
+    return int(difflib.SequenceMatcher(None, a, b).ratio() * 100)
 
 
 def find_fd_match(toto_row, matches):
@@ -244,32 +59,62 @@ def find_fd_match(toto_row, matches):
             best_score = score
             best = m
 
-    return best if best_score >= 125 else None
+    return best if best_score >= 105 else None
 
 
-def form(matches, team_id, today, n):
+@st.cache_data(ttl=900)
+def get_fd_teams():
+    data, err = fd_get("/teams", {"limit": 500})
+    return (data or {}).get("teams", []), err
+
+
+def find_team_id(name, teams):
+    best_id = None
+    best_score = 0
+    for t in teams:
+        score = max(
+            sim(name, t.get("name", "")),
+            sim(name, t.get("shortName", "")),
+            sim(name, t.get("tla", "")),
+        )
+        if score > best_score:
+            best_score = score
+            best_id = t.get("id")
+    return (best_id, best_score) if best_score >= 70 else (None, best_score)
+
+
+@st.cache_data(ttl=900)
+def get_team_history(team_id, date_from, date_to, limit=100):
+    data, err = fd_get(
+        f"/teams/{team_id}/matches",
+        {
+            "dateFrom": date_from,
+            "dateTo": date_to,
+            "status": "FINISHED",
+            "limit": limit,
+        },
+    )
+    return (data or {}).get("matches", []), err
+
+
+def form_from_team_matches(matches, team_id, today, n):
     games = []
-
     for m in matches:
         if m.get("status") != "FINISHED":
             continue
-
         try:
             d = datetime.fromisoformat(
                 m["utcDate"].replace("Z", "+00:00")
             ).date()
         except Exception:
             continue
-
         if d >= today:
             continue
-
         if team_id not in (
             m.get("homeTeam", {}).get("id"),
             m.get("awayTeam", {}).get("id"),
         ):
             continue
-
         games.append(m)
 
     games.sort(key=lambda x: x.get("utcDate", ""))
@@ -280,11 +125,9 @@ def form(matches, team_id, today, n):
 
     points = gf = ga = 0
     valid = 0
-
     for m in games:
         hs = m.get("score", {}).get("fullTime", {}).get("home")
         aws = m.get("score", {}).get("fullTime", {}).get("away")
-
         if hs is None or aws is None:
             continue
 
@@ -310,10 +153,6 @@ def form(matches, team_id, today, n):
 
 
 def model_probability(home, away, market_probs):
-    """
-    Market is used as a prior; historical form makes a limited correction.
-    This prevents the model from claiming extreme certainty from tiny samples.
-    """
     strength = (
         0.55 * (home["ppg"] - away["ppg"]) / 3
         + 0.25 * (home["gf"] - away["gf"]) / 3
@@ -330,7 +169,6 @@ def model_probability(home, away, market_probs):
     s = sum(form_raw)
     form_raw = [x / s for x in form_raw]
 
-    # 65% TOTO market prior + 35% historical form.
     final = [
         0.65 * market_probs[0] + 0.35 * form_raw[0],
         0.65 * market_probs[1] + 0.35 * form_raw[1],
@@ -356,53 +194,93 @@ today = datetime.now(TZ).date()
 
 fd_ok, fd_error = test_fd()
 
-# TOTO: bron voor wedstrijden van vandaag
+# TOTO blijft de primaire bron voor de wedstrijden van vandaag.
 toto_rows = []
 toto_error = ""
-
 try:
     toto_text = get_toto_text()
     toto_rows = parse_toto_today(toto_text)
 except Exception as e:
     toto_error = str(e)
 
-# football-data: alleen historie
+# Eerste historische poging: één gecombineerde call.
+# De matcher in v8 is veel toleranter dan v7.
 fd_matches, fd_matches_error = get_fd_matches(
-    (today - timedelta(days=180)).isoformat(),
+    (today - timedelta(days=365)).isoformat(),
     today.isoformat(),
 )
 
+# Tweede bron voor historische data: team-directory + team endpoint.
+# We gebruiken deze fallback alleen waar nodig, en eerst bij de wedstrijden
+# met de hoogste marktkans. Dit houdt het gratis API-limiet beheersbaar.
+fd_teams, fd_teams_error = get_fd_teams()
+
+def market_max(r):
+    return max(r["market_1"], r["market_x"], r["market_2"])
+
+candidate_order = sorted(
+    range(len(toto_rows)),
+    key=lambda i: market_max(toto_rows[i]),
+    reverse=True,
+)
+
+# Maximaal 6 wedstrijden krijgen de duurdere team-history fallback.
+fallback_indexes = set(candidate_order[:6])
+
 results = []
 
-for t in toto_rows:
+for idx, t in enumerate(toto_rows):
+    # Eerst proberen via de gezamenlijke matchset.
     m = find_fd_match(t, fd_matches)
+    hf = af = None
+    data_source = "Gezamenlijke historische dataset"
 
-    if not m:
-        results.append(
-            {
-                **t,
-                "prediction": None,
-                "model": None,
-                "market": max(t["market_1"], t["market_x"], t["market_2"]),
-                "value": None,
-                "status": "Geen historische koppeling",
-                "details": None,
-            }
+    if m:
+        hf = form(
+            fd_matches,
+            m.get("homeTeam", {}).get("id"),
+            today,
+            lookback,
         )
-        continue
+        af = form(
+            fd_matches,
+            m.get("awayTeam", {}).get("id"),
+            today,
+            lookback,
+        )
 
-    hf = form(
-        fd_matches,
-        m.get("homeTeam", {}).get("id"),
-        today,
-        lookback,
-    )
-    af = form(
-        fd_matches,
-        m.get("awayTeam", {}).get("id"),
-        today,
-        lookback,
-    )
+    # v8 fallback: zoek de teams rechtstreeks en vraag hun eigen historie op.
+    # Alleen voor de beste kandidaten, om binnen de gratis 10 req/min limiet
+    # van football-data.org te blijven.
+    if (not hf or not af) and idx in fallback_indexes and fd_ok and fd_teams:
+        home_id, home_score = find_team_id(t["home"], fd_teams)
+        away_id, away_score = find_team_id(t["away"], fd_teams)
+
+        if home_id and away_id:
+            home_hist, home_err = get_team_history(
+                home_id,
+                (today - timedelta(days=365)).isoformat(),
+                today.isoformat(),
+                100,
+            )
+            away_hist, away_err = get_team_history(
+                away_id,
+                (today - timedelta(days=365)).isoformat(),
+                today.isoformat(),
+                100,
+            )
+
+            hf = form_from_team_matches(
+                home_hist, home_id, today, lookback
+            )
+            af = form_from_team_matches(
+                away_hist, away_id, today, lookback
+            )
+
+            if hf and af:
+                data_source = (
+                    f"Teamhistorie (match {home_score:.0f}/{away_score:.0f})"
+                )
 
     if not hf or not af:
         results.append(
@@ -410,10 +288,11 @@ for t in toto_rows:
                 **t,
                 "prediction": None,
                 "model": None,
-                "market": max(t["market_1"], t["market_x"], t["market_2"]),
+                "market": market_max(t),
                 "value": None,
-                "status": "Te weinig historische data",
+                "status": "Onvoldoende historische data",
                 "details": None,
+                "data_source": data_source,
             }
         )
         continue
@@ -425,16 +304,16 @@ for t in toto_rows:
     ]
 
     probs = model_probability(hf, af, market)
-    idx = max(range(3), key=lambda i: probs[i])
-
     choices = [t["home"], "Gelijkspel", t["away"]]
-    model_pct = probs[idx] * 100
-    market_pct = market[idx] * 100
+    pick_idx = max(range(3), key=lambda i: probs[i])
+
+    model_pct = probs[pick_idx] * 100
+    market_pct = market[pick_idx] * 100
 
     results.append(
         {
             **t,
-            "prediction": choices[idx],
+            "prediction": choices[pick_idx],
             "model": model_pct,
             "market": market_pct,
             "value": model_pct - market_pct,
@@ -449,6 +328,7 @@ for t in toto_rows:
                 "home_games": hf["games"],
                 "away_games": af["games"],
             },
+            "data_source": data_source,
         }
     )
 
@@ -469,8 +349,8 @@ else:
 # ============================================================
 # DASHBOARD
 # ============================================================
-st.title("⚽ TOTO AI Voorspeller v7")
-st.caption("TOTO vandaag → historische vorm → modelkans → alleen TOP PICKS ≥ drempel")
+st.title("⚽ TOTO AI Voorspeller v8")
+st.caption("TOTO vandaag → verbeterde historische teamkoppeling → modelkans → TOP PICKS ≥ drempel")
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("TOTO-wedstrijden vandaag", len(toto_rows))
@@ -487,7 +367,7 @@ c4.metric(
 if fd_ok:
     st.success(
         "🟢 football-data.org is gekoppeld. "
-        "Deze API wordt in v7 alleen gebruikt voor historische vorm."
+        "Deze API wordt in v8 alleen gebruikt voor historische vorm en teamhistorie."
     )
 else:
     st.error(
@@ -578,7 +458,10 @@ with st.expander("📋 Alle TOTO-wedstrijden van vandaag"):
 with st.expander("🔎 Diagnose"):
     st.write(f"TOTO URL: {TOTO_URL}")
     st.write(f"TOTO gevonden: {len(toto_rows)} wedstrijden")
-    st.write(f"football-data.org historische wedstrijden: {len(fd_matches)}")
+    st.write(f"football-data.org historische wedstrijden in gecombineerde dataset: {len(fd_matches)}")
+    st.write(f"football-data.org teams gevonden: {len(fd_teams)}")
+    if fd_teams_error:
+        st.write("Team-directory fout:", fd_teams_error)
     if toto_error:
         st.write("TOTO-fout:", toto_error)
     if fd_matches_error:
@@ -586,19 +469,19 @@ with st.expander("🔎 Diagnose"):
     if not df.empty:
         st.write("Historische koppeling:")
         st.dataframe(
-            df[["home", "away", "status"]],
+            df[["home", "away", "status", "data_source"]],
             use_container_width=True,
             hide_index=True,
         )
 
-with st.expander("ℹ️ Over v7"):
+with st.expander("ℹ️ Over v8"):
     st.markdown(
         """
-**v7 is anders dan v6:**
+**v8 is anders dan v7:**
 
 1. **TOTO is de bron voor wedstrijden van vandaag.**
 2. **football-data.org is alleen de historische bron.**
-3. TOTO 1/X/2-odds worden omgerekend naar een genormaliseerde marktkans.
+3. Eerst wordt de gezamenlijke historische dataset gebruikt; als dat niet lukt, zoekt v8 het team rechtstreeks op en haalt de teamhistorie op.
 4. Recente vorm, punten per wedstrijd en doelpunten voor/tegen geven een beperkte correctie.
 5. Alleen een modelkans boven de ingestelde drempel wordt TOP PICK.
 
